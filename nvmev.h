@@ -9,6 +9,13 @@
 
 #include "nvme.h"
 
+/* PRP (Physical Region Page) address translation — NVMe host-provided
+ * physical address to kernel virtual address. Used by admin.c and any
+ * FTL that needs to read DSM range descriptors, etc. */
+#define prp_address_offset(prp, offset) \
+	(page_address(pfn_to_page(prp >> PAGE_SHIFT) + offset) + (prp & ~PAGE_MASK))
+#define prp_address(prp) prp_address_offset(prp, 0)
+
 #define CONFIG_NVMEV_IO_WORKER_BY_SQ
 #undef CONFIG_NVMEV_FAST_X86_IRQ_HANDLING
 
