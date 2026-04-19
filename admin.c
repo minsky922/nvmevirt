@@ -310,6 +310,7 @@ static void __nvmev_admin_identify_namespace(int eid)
 	}
 
 	ns->nlbaf = 6;
+	ns->nsfeat = 0x1; /* THINP — required for Linux to enable discard/TRIM */
 	ns->dps = 0;
 
 	ns->nsze = (nvmev_vdev->ns[nsid].size >> ns->lbaf[ns->flbas].ds);
@@ -426,7 +427,7 @@ static void __nvmev_admin_identify_ctrl(int eid)
 	memset(ctrl, 0x00, sizeof(*ctrl));
 
 	ctrl->nn = nvmev_vdev->nr_ns;
-	ctrl->oncs = 0; //optional command
+	ctrl->oncs = cpu_to_le16(NVME_CTRL_ONCS_DSM); /* DSM (Deallocate/TRIM) */
 	ctrl->acl = 3; //minimum 4 required, 0's based value
 	ctrl->vwc = 0;
 	snprintf(ctrl->sn, sizeof(ctrl->sn), "CSL_Virt_SN_%02d", 1);
