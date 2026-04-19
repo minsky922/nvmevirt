@@ -934,6 +934,33 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	return true;
 }
 
+/* Invalidate a range of LPNs. Used by DSM Deallocate.
+ *
+ * Extracted from the overwrite-invalidation block of conv_write(): we mark
+ * the existing PPA invalid and clear the reverse map. DSM additionally
+ * clears the forward map entry since no new PPA replaces it.
+ */
+static void conv_invalidate_lpn_range(struct conv_ftl *conv_ftls,
+				      uint32_t nr_parts,
+				      uint64_t start_lpn, uint64_t end_lpn)
+{
+	struct conv_ftl *conv_ftl;
+	uint64_t lpn, local_lpn;
+	struct ppa ppa;
+
+	for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+		conv_ftl = &conv_ftls[lpn % nr_parts];
+		local_lpn = lpn / nr_parts;
+		ppa = get_maptbl_ent(conv_ftl, local_lpn);
+		if (!mapped_ppa(&ppa))
+			continue;
+		mark_page_invalid(conv_ftl, &ppa);
+		set_rmap_ent(conv_ftl, INVALID_LPN, &ppa);
+		ppa.ppa = UNMAPPED_PPA;
+		set_maptbl_ent(conv_ftl, local_lpn, &ppa);
+	}
+}
+
 static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
 	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
@@ -1037,6 +1064,60 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	return true;
 }
 
+/* Handle NVMe Dataset Management command.
+ *
+ * Only the Deallocate attribute (NVME_DSMGMT_AD) has side effects here;
+ * IDR/IDW advisory hints are accepted and ignored.
+ */
+static bool conv_dsm(struct nvmev_ns *ns, struct nvmev_request *req,
+		     struct nvmev_result *ret)
+{
+	struct nvme_dsm_cmd *cmd = (struct nvme_dsm_cmd *)req->cmd;
+	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
+	struct ssdparams *spp = &conv_ftls[0].ssd->sp;
+	uint32_t nr_parts = ns->nr_parts;
+	uint32_t nr_ranges = le32_to_cpu(cmd->nr) + 1; /* 0-based */
+	uint32_t attr = le32_to_cpu(cmd->attributes);
+	struct nvme_dsm_range *ranges;
+	uint32_t i;
+
+	ret->nsecs_target = req->nsecs_start;
+
+	if (!(attr & NVME_DSMGMT_AD)) {
+		ret->status = NVME_SC_SUCCESS;
+		return true;
+	}
+
+	ranges = prp_address(cmd->prp1);
+	if (!ranges) {
+		ret->status = NVME_SC_DATA_XFER_ERROR;
+		return false;
+	}
+
+	for (i = 0; i < nr_ranges; i++) {
+		uint64_t slba = le64_to_cpu(ranges[i].slba);
+		uint32_t nlb = le32_to_cpu(ranges[i].nlb);
+		uint64_t start_lpn, end_lpn;
+
+		if (nlb == 0)
+			continue;
+
+		start_lpn = slba / spp->secs_per_pg;
+		end_lpn = (slba + nlb - 1) / spp->secs_per_pg;
+
+		if ((end_lpn / nr_parts) >= spp->tt_pgs) {
+			NVMEV_ERROR("conv_dsm: range %u out of bounds "
+				    "(slba=%llu nlb=%u)\n", i, slba, nlb);
+			continue;
+		}
+
+		conv_invalidate_lpn_range(conv_ftls, nr_parts, start_lpn, end_lpn);
+	}
+
+	ret->status = NVME_SC_SUCCESS;
+	return true;
+}
+
 static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
 	uint64_t start, latest;
@@ -1073,6 +1154,10 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 		break;
 	case nvme_cmd_flush:
 		conv_flush(ns, req, ret);
+		break;
+	case nvme_cmd_dsm:
+		if (!conv_dsm(ns, req, ret))
+			return false;
 		break;
 	default:
 		NVMEV_ERROR("%s: command not implemented: %s (0x%x)\n", __func__,
