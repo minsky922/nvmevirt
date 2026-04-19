@@ -7,6 +7,11 @@
 #include "nvmev.h"
 #include "conv_ftl.h"
 
+/* GC measurement counters */
+static atomic64_t gc_count = ATOMIC64_INIT(0);
+static atomic64_t gc_valid_pages = ATOMIC64_INIT(0);
+static atomic64_t host_write_pages = ATOMIC64_INIT(0);
+
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -806,6 +811,13 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 		}
 	}
 
+	atomic64_inc(&gc_count);
+	atomic64_add(victim_line->vpc, &gc_valid_pages);
+	if (atomic64_read(&gc_count) % 1000 == 0) {
+	printk(KERN_INFO "NVMeVirt GC #%lld: vpc=%d ipc=%d host_writes=%lld gc_copies=%lld\n",
+		atomic64_read(&gc_count), victim_line->vpc, victim_line->ipc,
+		atomic64_read(&host_write_pages), atomic64_read(&gc_valid_pages));
+	}
 	/* update line status */
 	mark_line_free(conv_ftl, &ppa);
 
@@ -996,6 +1008,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 		/* need to advance the write pointer here */
 		advance_write_pointer(conv_ftl, USER_IO);
+		atomic64_inc(&host_write_pages);
 
 		/* Aggregate write io in flash page */
 		if (last_pg_in_wordline(conv_ftl, &ppa)) {
